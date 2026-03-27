@@ -10,23 +10,43 @@
  * are fully independent, enabling proactive messaging and background
  * listening.
  *
+ * Configuration:
+ *   Copy .env.example to .env and set DIRECTLINE_TOKEN_ENDPOINT to your
+ *   Copilot Studio token endpoint URL.
+ *
  * Usage:
- *   DIRECTLINE_TOKEN_ENDPOINT="https://..." npx tsx samples/directline/directlineConsole.ts
- *   DIRECTLINE_TOKEN_ENDPOINT="https://..." npx tsx samples/directline/directlineConsole.ts --poll
+ *   npx tsx --env-file=samples/directline/.env samples/directline/directlineConsole.ts
+ *   npx tsx --env-file=samples/directline/.env samples/directline/directlineConsole.ts --poll
  */
 
 import readline from 'readline'
 import { Activity, ActivityTypes, CardAction } from '@microsoft/agents-activity'
-import { DirectLineClient } from '@microsoft/agents-directline-client'
+import { DirectLineClient, DirectLineSettings } from '@microsoft/agents-directline-client'
 
-const TOKEN_ENDPOINT = process.env.DIRECTLINE_TOKEN_ENDPOINT
-if (!TOKEN_ENDPOINT) {
-  console.error('Error: DIRECTLINE_TOKEN_ENDPOINT environment variable is required.')
-  console.error('Example: https://{env}.environment.api.powerplatform.com/powervirtualagents/botsbyschema/{bot}/directline/token?api-version=2022-03-01-preview')
-  process.exit(1)
+// ---------------------------------------------------------------------------
+// Settings (loaded from environment / .env file)
+// ---------------------------------------------------------------------------
+
+function loadSettings (): DirectLineSettings {
+  const tokenEndpoint = process.env.DIRECTLINE_TOKEN_ENDPOINT
+  if (!tokenEndpoint) {
+    console.error('Error: DIRECTLINE_TOKEN_ENDPOINT is required.')
+    console.error('Copy .env.example to .env and set the token endpoint URL.')
+    console.error('Example: https://{env}.environment.api.powerplatform.com/powervirtualagents/botsbyschema/{bot}/directline/token?api-version=2022-03-01-preview')
+    process.exit(1)
+  }
+  return { tokenEndpoint }
 }
 
-const usePolling = process.argv.includes('--poll')
+function getTransportMode (): 'websocket' | 'polling' {
+  if (process.argv.includes('--poll')) return 'polling'
+  const envTransport = process.env.DIRECTLINE_TRANSPORT?.toLowerCase()
+  if (envTransport === 'polling') return 'polling'
+  return 'websocket'
+}
+
+const settings = loadSettings()
+const transport = getTransportMode()
 
 // ---------------------------------------------------------------------------
 // Activity Printer
@@ -67,11 +87,11 @@ async function listenInBackground (
   conversation: { conversationId: string, token: string, streamUrl: string },
   signal: AbortSignal,
 ): Promise<void> {
-  const mode = usePolling ? 'polling' : 'WebSocket'
+  const mode = transport === 'polling' ? 'polling' : 'WebSocket'
   console.log(`\n  [listener] Started (${mode} mode)\n`)
 
   try {
-    const listener = usePolling
+    const listener = transport === 'polling'
       ? client.listenPolling(conversation, { interval: 1000 }, signal)
       : client.listenWebSocket(conversation, {}, signal)
 
@@ -140,11 +160,11 @@ async function inputLoop (
 async function main (): Promise<void> {
   console.log('DirectLine Console Sample')
   console.log('='.repeat(40))
-  console.log(`  Mode: ${usePolling ? 'HTTP Polling' : 'WebSocket'}`)
-  console.log(`  Token endpoint: ${TOKEN_ENDPOINT!.substring(0, 60)}...`)
+  console.log(`  Mode: ${transport === 'polling' ? 'HTTP Polling' : 'WebSocket'}`)
+  console.log(`  Token endpoint: ${settings.tokenEndpoint.substring(0, 60)}...`)
   console.log()
 
-  const client = new DirectLineClient({ tokenEndpoint: TOKEN_ENDPOINT! })
+  const client = new DirectLineClient(settings)
 
   console.log('  Connecting...')
   const conversation = await client.startConversation()
