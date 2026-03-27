@@ -16,6 +16,8 @@ import {
 } from './types'
 
 const DEFAULT_DIRECTLINE_DOMAIN = 'https://directline.botframework.com/v3/directline'
+const MAX_POLLING_RETRIES = 5
+const INITIAL_BACKOFF_MS = 1000
 
 /**
  * DirectLine v3 client for Copilot Studio agents.
@@ -60,7 +62,9 @@ export class DirectLineClient {
   // ---------------------------------------------------------------------------
 
   /**
-   * Fetches a DirectLine token from the Copilot Studio token endpoint.
+   * Fetches a fresh DirectLine token from the Copilot Studio token endpoint.
+   * Always makes a network call — tokens are not cached across calls because
+   * DirectLine tokens expire (~30 minutes).
    */
   async getToken (): Promise<string> {
     const response = await fetch(this.settings.tokenEndpoint)
@@ -84,6 +88,9 @@ export class DirectLineClient {
    *
    * Returns the full domain (e.g. "https://europe.directline.botframework.com/v3/directline")
    * or falls back to the global default.
+   *
+   * Only caches the domain when regional discovery succeeds. Transient failures
+   * return the global default without caching, so the next call will retry.
    */
   async discoverDomain (): Promise<string> {
     if (this.domain) return this.domain
@@ -101,12 +108,12 @@ export class DirectLineClient {
           }
         }
       } catch {
-        // Fall through to default
+        // Fall through to default — do NOT cache the fallback
       }
     }
 
-    this.domain = DEFAULT_DIRECTLINE_DOMAIN
-    return this.domain
+    // Return the default without caching so next call retries discovery
+    return DEFAULT_DIRECTLINE_DOMAIN
   }
 
   // ---------------------------------------------------------------------------
@@ -116,12 +123,12 @@ export class DirectLineClient {
   /**
    * Starts a new DirectLine conversation.
    *
-   * Automatically fetches a token and discovers the regional domain if not
-   * already done.
+   * Always fetches a fresh token (DirectLine tokens expire ~30min).
+   * Discovers the regional domain if not already cached.
    */
   async startConversation (): Promise<DirectLineConversation> {
     const [token, domain] = await Promise.all([
-      this.token ? Promise.resolve(this.token) : this.getToken(),
+      this.getToken(),
       this.discoverDomain(),
     ])
 
@@ -197,11 +204,15 @@ export class DirectLineClient {
     if (!token) throw new Error('No token available.')
 
     const url = watermark
-      ? `${domain}/conversations/${conversationId}/activities?watermark=${watermark}`
+      ? `${domain}/conversations/${conversationId}/activities?watermark=${encodeURIComponent(watermark)}`
       : `${domain}/conversations/${conversationId}/activities`
 
     const response = await fetch(url, {
-      headers: { Authorization: `Bearer ${token}` },
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Cache-Control': 'no-cache',
+        Pragma: 'no-cache',
+      },
     })
 
     if (!response.ok) {
@@ -222,6 +233,10 @@ export class DirectLineClient {
    * activities. The generator runs until the caller breaks out of the loop
    * or the AbortSignal fires.
    *
+   * Transient errors (network, 5xx) are retried with exponential backoff
+   * up to {@link MAX_POLLING_RETRIES} times. Fatal errors (401) are rethrown
+   * immediately.
+   *
    * @param conversation - The conversation to listen on.
    * @param options - Polling interval and other options.
    * @param signal - Optional AbortSignal to stop the listener.
@@ -235,19 +250,39 @@ export class DirectLineClient {
   ): AsyncGenerator<Activity> {
     const interval = options?.interval ?? 1000
     let watermark: string | undefined
+    let consecutiveErrors = 0
 
     while (!signal?.aborted) {
-      const result = await this.getActivities(conversation.conversationId, watermark)
-      if (result.watermark) {
-        watermark = result.watermark
-      }
+      try {
+        const result = await this.getActivities(conversation.conversationId, watermark)
+        consecutiveErrors = 0
 
-      for (const activity of result.activities) {
-        if (interceptor) {
-          const keep = interceptor(activity)
-          if (keep === false) continue
+        if (result.watermark) {
+          watermark = result.watermark
         }
-        yield activity
+
+        for (const activity of result.activities) {
+          if (interceptor) {
+            const keep = interceptor(activity)
+            if (keep === false) continue
+          }
+          yield activity
+        }
+      } catch (err: any) {
+        // Fatal: 401 means token expired — caller must handle
+        if (err?.message?.includes('401')) {
+          throw err
+        }
+
+        consecutiveErrors++
+        if (consecutiveErrors > MAX_POLLING_RETRIES) {
+          throw new Error(`Polling failed after ${MAX_POLLING_RETRIES} consecutive retries: ${err?.message}`)
+        }
+
+        // Exponential backoff: 1s, 2s, 4s, 8s, 16s
+        const backoff = INITIAL_BACKOFF_MS * Math.pow(2, consecutiveErrors - 1)
+        await delay(backoff)
+        continue
       }
 
       await delay(interval)
@@ -326,19 +361,23 @@ export class DirectLineClient {
     }
     signal?.addEventListener('abort', onAbort, { once: true })
 
-    // Wait for connection to open
+    // Wait for connection to open.
+    // Use ws.once for the error handler so it auto-removes after firing
+    // and doesn't duplicate the top-level 'error' handler.
     await new Promise<void>((res, rej) => {
       const timeout = setTimeout(() => {
         ws.close()
         rej(new Error(`WebSocket connection timed out after ${connectTimeout}ms`))
       }, connectTimeout)
 
-      ws.on('open', () => {
+      ws.once('open', () => {
         clearTimeout(timeout)
         res()
       })
 
-      ws.on('error', (err) => {
+      // This handler fires only if the connection fails before opening.
+      // After the promise settles, the top-level 'error' handler takes over.
+      ws.once('error', (err) => {
         clearTimeout(timeout)
         rej(err)
       })
@@ -352,6 +391,12 @@ export class DirectLineClient {
         }
 
         if (closed || signal?.aborted) break
+
+        // Check if messages arrived while we were yielding (race fix:
+        // messages can arrive while the generator consumer is suspended
+        // mid-drain, when resolve is undefined). If so, drain again
+        // instead of sleeping.
+        if (messageQueue.length > 0) continue
 
         // Wait for the next message or close
         await new Promise<void>((res) => {

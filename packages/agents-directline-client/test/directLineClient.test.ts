@@ -127,7 +127,7 @@ describe('DirectLineClient', () => {
       assert.equal(domain, 'https://directline.botframework.com/v3/directline')
     })
 
-    it('caches the discovered domain', async () => {
+    it('caches the discovered domain on success', async () => {
       const fetchMock = createMockFetch({
         'regionalchannelsettings': () => ({
           status: 200,
@@ -142,6 +142,36 @@ describe('DirectLineClient', () => {
 
       assert.equal(domain1, domain2)
       assert.equal(fetchMock.mock.callCount(), 1)
+    })
+
+    it('does NOT cache the fallback default — retries on next call', async () => {
+      let callCount = 0
+      globalThis.fetch = mock.fn(async (url: string | URL | Request) => {
+        const urlStr = typeof url === 'string' ? url : url instanceof URL ? url.href : url.url
+        if (urlStr.includes('regionalchannelsettings')) {
+          callCount++
+          if (callCount === 1) {
+            // First call: transient failure
+            return new Response('', { status: 500 })
+          }
+          // Second call: success
+          return new Response(JSON.stringify({
+            channelUrlsById: { directline: 'https://europe.directline.botframework.com' },
+          }), { status: 200 })
+        }
+        return new Response('', { status: 404 })
+      }) as any
+
+      const client = new DirectLineClient({ tokenEndpoint: TOKEN_ENDPOINT })
+
+      // First call: falls back to default (not cached)
+      const domain1 = await client.discoverDomain()
+      assert.equal(domain1, 'https://directline.botframework.com/v3/directline')
+
+      // Second call: retries and succeeds
+      const domain2 = await client.discoverDomain()
+      assert.equal(domain2, 'https://europe.directline.botframework.com/v3/directline')
+      assert.equal(callCount, 2)
     })
   })
 
@@ -172,6 +202,32 @@ describe('DirectLineClient', () => {
       assert.equal(conv.conversationId, 'conv-abc')
       assert.equal(conv.token, 'tok-refreshed')
       assert.ok(conv.streamUrl.includes('conv-abc'))
+    })
+  })
+
+  describe('startConversation — token freshness', () => {
+    it('always fetches a fresh token on each startConversation call', async () => {
+      let tokenCallCount = 0
+      globalThis.fetch = mock.fn(async (url: string | URL | Request) => {
+        const urlStr = typeof url === 'string' ? url : url instanceof URL ? url.href : url.url
+        if (urlStr.includes('directline/token')) {
+          tokenCallCount++
+          return new Response(JSON.stringify({ token: `tok-${tokenCallCount}` }), { status: 200 })
+        }
+        if (urlStr.includes('regionalchannelsettings')) {
+          return new Response(JSON.stringify({ channelUrlsById: { directline: 'https://directline.botframework.com' } }), { status: 200 })
+        }
+        if (urlStr.includes('conversations')) {
+          return new Response(JSON.stringify({ conversationId: `conv-${tokenCallCount}`, streamUrl: '' }), { status: 200 })
+        }
+        return new Response('', { status: 404 })
+      }) as any
+
+      const client = new DirectLineClient({ tokenEndpoint: TOKEN_ENDPOINT })
+      await client.startConversation()
+      await client.startConversation()
+
+      assert.equal(tokenCallCount, 2, 'getToken should be called for each startConversation')
     })
   })
 
@@ -227,6 +283,27 @@ describe('DirectLineClient', () => {
       assert.equal(result.activities.length, 1)
       assert.equal(result.activities[0].text, 'Hello from bot')
       assert.equal(result.watermark, '1')
+    })
+
+    it('URL-encodes the watermark parameter', async () => {
+      let capturedUrl = ''
+      globalThis.fetch = mock.fn(async (url: string | URL | Request) => {
+        const urlStr = typeof url === 'string' ? url : url instanceof URL ? url.href : url.url
+        if (urlStr.includes('activities')) capturedUrl = urlStr
+        if (urlStr.includes('regionalchannelsettings')) {
+          return new Response(JSON.stringify({ channelUrlsById: { directline: 'https://directline.botframework.com' } }), { status: 200 })
+        }
+        if (urlStr.includes('directline/token')) {
+          return new Response(JSON.stringify({ token: 'tok-1' }), { status: 200 })
+        }
+        return new Response(JSON.stringify({ activities: [], watermark: '5' }), { status: 200 })
+      }) as any
+
+      const client = new DirectLineClient({ tokenEndpoint: TOKEN_ENDPOINT })
+      await client.getToken()
+      await client.getActivities('conv-1', 'wm=foo&bar')
+
+      assert.ok(capturedUrl.includes('watermark=wm%3Dfoo%26bar'), `Expected encoded watermark in URL: ${capturedUrl}`)
     })
 
     it('passes watermark as query parameter', async () => {
@@ -336,6 +413,71 @@ describe('DirectLineClient', () => {
       assert.equal(collected.length, 1)
       assert.equal(collected[0].type, 'message')
       assert.equal(collected[0].text, 'real reply')
+    })
+  })
+
+  describe('listenPolling — error handling', () => {
+    it('retries on transient errors and recovers', async () => {
+      let callCount = 0
+      globalThis.fetch = mock.fn(async (url: string | URL | Request) => {
+        const urlStr = typeof url === 'string' ? url : url instanceof URL ? url.href : url.url
+        if (urlStr.includes('regionalchannelsettings')) {
+          return new Response(JSON.stringify({ channelUrlsById: { directline: 'https://directline.botframework.com' } }), { status: 200 })
+        }
+        if (urlStr.includes('directline/token')) {
+          return new Response(JSON.stringify({ token: 'tok-1' }), { status: 200 })
+        }
+        callCount++
+        // First call: 500 error (transient)
+        if (callCount === 1) {
+          return new Response('Server Error', { status: 500, statusText: 'Internal Server Error' })
+        }
+        // Second call: success
+        return new Response(JSON.stringify({
+          activities: [{ type: 'message', text: 'recovered', from: { id: 'bot' } }],
+          watermark: '1',
+        }), { status: 200 })
+      }) as any
+
+      const client = new DirectLineClient({ tokenEndpoint: TOKEN_ENDPOINT })
+      await client.getToken()
+
+      const controller = new AbortController()
+      const conversation = { conversationId: 'conv-1', token: 'tok-1', streamUrl: '' }
+      const collected: Activity[] = []
+
+      for await (const activity of client.listenPolling(conversation, { interval: 50 }, controller.signal)) {
+        collected.push(activity)
+        controller.abort()
+      }
+
+      assert.equal(collected.length, 1)
+      assert.equal(collected[0].text, 'recovered')
+      assert.ok(callCount >= 2, 'Should have retried after the transient error')
+    })
+
+    it('throws immediately on 401 (token expired)', async () => {
+      globalThis.fetch = mock.fn(async (url: string | URL | Request) => {
+        const urlStr = typeof url === 'string' ? url : url instanceof URL ? url.href : url.url
+        if (urlStr.includes('regionalchannelsettings')) {
+          return new Response(JSON.stringify({ channelUrlsById: { directline: 'https://directline.botframework.com' } }), { status: 200 })
+        }
+        if (urlStr.includes('directline/token')) {
+          return new Response(JSON.stringify({ token: 'tok-1' }), { status: 200 })
+        }
+        return new Response('Unauthorized', { status: 401, statusText: 'Unauthorized' })
+      }) as any
+
+      const client = new DirectLineClient({ tokenEndpoint: TOKEN_ENDPOINT })
+      await client.getToken()
+
+      const conversation = { conversationId: 'conv-1', token: 'tok-1', streamUrl: '' }
+
+      await assert.rejects(async () => {
+        for await (const _ of client.listenPolling(conversation, { interval: 50 })) {
+          // Should not reach here
+        }
+      }, /401/)
     })
   })
 
