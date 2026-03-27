@@ -1,0 +1,49 @@
+{
+  "name": "@microsoft/agents-directline-client",
+  "version": "0.1.0",
+  "homepage": "https://github.com/microsoft/Agents-for-js",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/microsoft/Agents-for-js.git"
+  },
+  "author": {
+    "name": "Microsoft",
+    "email": "agentssdk@microsoft.com",
+    "url": "https://aka.ms/Agents"
+  },
+  "description": "DirectLine v3 client for connecting to Copilot Studio agents via Azure Bot Service DirectLine API.",
+  "keywords": [
+    "Agents",
+    "DirectLine",
+    "copilotstudio",
+    "botframework"
+  ],
+  "main": "dist/src/index.js",
+  "types": "dist/src/index.d.ts",
+  "scripts": {},
+  "dependencies": {
+    "@microsoft/agents-activity": "file:../agents-activity",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/ws": "^8.5.13"
+  },
+  "license": "MIT",
+  "files": [
+    "README.md",
+    "dist/src",
+    "src",
+    "package.json"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/src/index.d.ts",
+      "import": "./dist/src/index.js",
+      "require": "./dist/src/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
