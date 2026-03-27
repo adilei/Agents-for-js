@@ -7,19 +7,33 @@ import WebSocket from 'ws'
 import { Activity } from '@microsoft/agents-activity'
 import {
   DirectLineSettings,
-  TokenResponse,
   DirectLineConversation,
   ActivitySet,
   PollingListenerOptions,
   WebSocketListenerOptions,
-  ActivityInterceptor,
   ConnectionStatus,
-  ConnectionStatusCallback,
 } from './types'
+
+/** @internal */
+interface TokenResponse {
+  token: string
+  conversationId?: string
+}
 
 const DEFAULT_DIRECTLINE_DOMAIN = 'https://directline.botframework.com/v3/directline'
 const MAX_POLLING_RETRIES = 5
 const INITIAL_BACKOFF_MS = 1000
+
+/**
+ * Error thrown when a DirectLine HTTP request fails.
+ * Includes the HTTP status code for structured error handling.
+ */
+export class DirectLineHttpError extends Error {
+  constructor (public readonly status: number, message: string) {
+    super(message)
+    this.name = 'DirectLineHttpError'
+  }
+}
 
 /**
  * DirectLine v3 client for Copilot Studio agents.
@@ -74,7 +88,7 @@ export class DirectLineClient {
   async getToken (): Promise<string> {
     const response = await fetch(this.settings.tokenEndpoint)
     if (!response.ok) {
-      throw new Error(`Token fetch failed: ${response.status} ${response.statusText}`)
+      throw new DirectLineHttpError(response.status, `Token fetch failed: ${response.status} ${response.statusText}`)
     }
     const data: TokenResponse = await response.json()
     if (!data.token) {
@@ -139,7 +153,7 @@ export class DirectLineClient {
     })
 
     if (!response.ok) {
-      throw new Error(`Start conversation failed: ${response.status} ${response.statusText}`)
+      throw new DirectLineHttpError(response.status, `Start conversation failed: ${response.status} ${response.statusText}`)
     }
 
     const data = await response.json()
@@ -181,7 +195,7 @@ export class DirectLineClient {
     })
 
     if (!response.ok) {
-      throw new Error(`Send activity failed: ${response.status} ${response.statusText}`)
+      throw new DirectLineHttpError(response.status, `Send activity failed: ${response.status} ${response.statusText}`)
     }
 
     const data = await response.json()
@@ -213,7 +227,7 @@ export class DirectLineClient {
     })
 
     if (!response.ok) {
-      throw new Error(`Get activities failed: ${response.status} ${response.statusText}`)
+      throw new DirectLineHttpError(response.status, `Get activities failed: ${response.status} ${response.statusText}`)
     }
 
     const data = await response.json()
@@ -268,7 +282,6 @@ export class DirectLineClient {
 
         if (result.watermark) {
           watermark = result.watermark
-          // Update the conversation object so the caller can read the latest watermark
           conversation.watermark = watermark
         }
 
@@ -280,13 +293,19 @@ export class DirectLineClient {
           yield activity
         }
       } catch (err: any) {
-        if (err?.message?.includes('401')) {
+        // Fatal: 401 means token expired — caller must handle
+        if (err instanceof DirectLineHttpError && err.status === 401) {
           onStatus?.(ConnectionStatus.TokenExpired)
           throw err
         }
 
         consecutiveErrors++
-        onStatus?.(ConnectionStatus.Reconnecting)
+
+        // Only emit Reconnecting if we were previously connected.
+        // Before initial connection, we stay in Connecting state.
+        if (connected) {
+          onStatus?.(ConnectionStatus.Reconnecting)
+        }
 
         if (consecutiveErrors > MAX_POLLING_RETRIES) {
           onStatus?.(ConnectionStatus.Disconnected)
@@ -338,14 +357,16 @@ export class DirectLineClient {
 
     const ws = new WebSocket(conversation.streamUrl)
     const messageQueue: Activity[] = []
-    let resolve: (() => void) | undefined
+    // Signaling mechanism: when the consumer is waiting, `pending` holds the
+    // resolve callback. The producer (message/close/error handlers) calls it
+    // to wake the consumer. Set to undefined when the consumer is not waiting.
+    let pending: (() => void) | undefined
     let error: Error | undefined
     let closed = false
 
     ws.on('message', (data: WebSocket.Data) => {
       try {
         const parsed = JSON.parse(data.toString())
-        // Update watermark from WebSocket frames if present
         if (parsed.watermark) {
           conversation.watermark = parsed.watermark
         }
@@ -358,7 +379,11 @@ export class DirectLineClient {
           }
           messageQueue.push(activity)
         }
-        resolve?.()
+        if (pending) {
+          const wake = pending
+          pending = undefined
+          wake()
+        }
       } catch {
         // Ignore unparseable frames
       }
@@ -366,13 +391,21 @@ export class DirectLineClient {
 
     ws.on('close', () => {
       closed = true
-      resolve?.()
+      if (pending) {
+        const wake = pending
+        pending = undefined
+        wake()
+      }
     })
 
     ws.on('error', (err: Error) => {
       error = err
       closed = true
-      resolve?.()
+      if (pending) {
+        const wake = pending
+        pending = undefined
+        wake()
+      }
     })
 
     const onAbort = () => {
@@ -402,15 +435,23 @@ export class DirectLineClient {
 
     try {
       while (!closed && !signal?.aborted) {
+        // Drain the queue
         while (messageQueue.length > 0) {
           yield messageQueue.shift()!
         }
 
         if (closed || signal?.aborted) break
+
+        // Re-check after yielding — messages may have arrived while the
+        // generator consumer was suspended between .next() calls.
         if (messageQueue.length > 0) continue
 
+        // Park until the producer signals. The `pending` callback is set
+        // *inside* the Promise executor (which runs synchronously), so there
+        // is no gap where a producer event could fire before `pending` is
+        // assigned.
         await new Promise<void>((res) => {
-          resolve = res
+          pending = res
         })
 
         if (error) {
@@ -418,6 +459,7 @@ export class DirectLineClient {
         }
       }
 
+      // Drain any remaining messages
       while (messageQueue.length > 0) {
         yield messageQueue.shift()!
       }

@@ -21,7 +21,7 @@
 
 import readline from 'readline'
 import { Activity, ActivityTypes, CardAction } from '@microsoft/agents-activity'
-import { DirectLineClient, DirectLineSettings } from '@microsoft/agents-directline-client'
+import { DirectLineClient, DirectLineConversation, DirectLineSettings } from '@microsoft/agents-directline-client'
 
 // ---------------------------------------------------------------------------
 // Settings (loaded from environment / .env file)
@@ -84,7 +84,7 @@ function printActivity (activity: Activity): void {
 
 async function listenInBackground (
   client: DirectLineClient,
-  conversation: { conversationId: string, token: string, streamUrl: string },
+  conversation: DirectLineConversation,
   signal: AbortSignal,
 ): Promise<void> {
   const mode = transport === 'polling' ? 'polling' : 'WebSocket'

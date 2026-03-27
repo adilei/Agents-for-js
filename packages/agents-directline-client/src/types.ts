@@ -5,6 +5,10 @@
 
 import { Activity } from '@microsoft/agents-activity'
 
+// ---------------------------------------------------------------------------
+// Public API types
+// ---------------------------------------------------------------------------
+
 /**
  * Settings for connecting to a Copilot Studio agent via DirectLine.
  */
@@ -14,23 +18,6 @@ export interface DirectLineSettings {
    * Example: https://{env}.environment.api.powerplatform.com/powervirtualagents/botsbyschema/{bot}/directline/token?api-version=2022-03-01-preview
    */
   tokenEndpoint: string
-}
-
-/**
- * Response from the Copilot Studio token endpoint.
- */
-export interface TokenResponse {
-  token: string
-  conversationId?: string
-}
-
-/**
- * Response from the regional channel settings endpoint.
- */
-export interface RegionalChannelSettings {
-  channelUrlsById?: {
-    directline?: string
-  }
 }
 
 /**
@@ -54,24 +41,6 @@ export interface ActivitySet {
 }
 
 /**
- * Options for the polling listener.
- */
-export interface PollingOptions {
-  /** Polling interval in milliseconds. Default: 1000. */
-  interval?: number
-  /** Resume from this watermark — skips activities already seen. */
-  watermark?: string
-}
-
-/**
- * Options for the WebSocket listener.
- */
-export interface WebSocketOptions {
-  /** Timeout in ms to wait for the WebSocket to open. Default: 10000. */
-  connectTimeout?: number
-}
-
-/**
  * Callback for intercepting activities as they arrive from the agent.
  * Return `false` to suppress the activity from the listener's output.
  */
@@ -89,13 +58,17 @@ export type ActivityInterceptor = (activity: Activity) => boolean | void
  *                Connected → TokenExpired
  *                Connected → Reconnecting → Connected
  *                Connected → Reconnecting → Disconnected
+ *
+ * Note: If the initial connection fails (before ever reaching Connected),
+ * the status remains Connecting until Disconnected — Reconnecting is only
+ * emitted after a prior successful connection.
  */
 export enum ConnectionStatus {
   /** Establishing the initial connection. */
   Connecting = 'connecting',
   /** Connected and receiving activities. */
   Connected = 'connected',
-  /** Retrying after a transient error (polling only). */
+  /** Retrying after a transient error (only after a prior Connected state). */
   Reconnecting = 'reconnecting',
   /** Connection closed normally or via AbortSignal. */
   Disconnected = 'disconnected',
@@ -107,6 +80,10 @@ export enum ConnectionStatus {
  * Callback invoked when the listener connection status changes.
  */
 export type ConnectionStatusCallback = (status: ConnectionStatus) => void
+
+// ---------------------------------------------------------------------------
+// Listener Options
+// ---------------------------------------------------------------------------
 
 /**
  * Options shared by both listener methods.
@@ -121,9 +98,17 @@ export interface ListenerOptions {
 /**
  * Full options for the polling listener.
  */
-export interface PollingListenerOptions extends ListenerOptions, PollingOptions {}
+export interface PollingListenerOptions extends ListenerOptions {
+  /** Polling interval in milliseconds. Default: 1000. */
+  interval?: number
+  /** Resume from this watermark — skips activities already seen. */
+  watermark?: string
+}
 
 /**
  * Full options for the WebSocket listener.
  */
-export interface WebSocketListenerOptions extends ListenerOptions, WebSocketOptions {}
+export interface WebSocketListenerOptions extends ListenerOptions {
+  /** Timeout in ms to wait for the WebSocket to open. Default: 10000. */
+  connectTimeout?: number
+}

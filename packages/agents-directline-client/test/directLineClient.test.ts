@@ -1,6 +1,6 @@
 import { strict as assert } from 'assert'
 import { describe, it, mock, beforeEach, afterEach } from 'node:test'
-import { DirectLineClient } from '../src/directLineClient'
+import { DirectLineClient, DirectLineHttpError } from '../src/directLineClient'
 import { ConnectionStatus } from '../src/types'
 import { Activity } from '@microsoft/agents-activity'
 import WebSocket, { WebSocketServer } from 'ws'
@@ -463,7 +463,7 @@ describe('DirectLineClient', () => {
       assert.ok(statuses.includes(ConnectionStatus.Disconnected))
     })
 
-    it('emits Reconnecting then Connected on transient error recovery', async () => {
+    it('emits Reconnecting then Connected on transient error after initial connection', async () => {
       let callCount = 0
       globalThis.fetch = mock.fn(async (url: string | URL | Request) => {
         const urlStr = typeof url === 'string' ? url : url instanceof URL ? url.href : url.url
@@ -474,12 +474,21 @@ describe('DirectLineClient', () => {
           return new Response(JSON.stringify({ token: 'tok-1' }), { status: 200 })
         }
         callCount++
+        // Call 1: success (establishes connected state)
         if (callCount === 1) {
+          return new Response(JSON.stringify({
+            activities: [{ type: 'message', text: 'hello', from: { id: 'bot' } }],
+            watermark: '1',
+          }), { status: 200 })
+        }
+        // Call 2: transient 500 error
+        if (callCount === 2) {
           return new Response('Server Error', { status: 500, statusText: 'Internal Server Error' })
         }
+        // Call 3+: recovered
         return new Response(JSON.stringify({
           activities: [{ type: 'message', text: 'recovered', from: { id: 'bot' } }],
-          watermark: '1',
+          watermark: '2',
         }), { status: 200 })
       }) as any
 
@@ -489,22 +498,25 @@ describe('DirectLineClient', () => {
       const controller = new AbortController()
       const conversation = { conversationId: 'conv-1', token: 'tok-1', streamUrl: '' }
       const statuses: ConnectionStatus[] = []
+      let activityCount = 0
 
       for await (const _ of client.listenPolling(conversation, {
         interval: 50,
         onStatusChange: (s) => statuses.push(s),
       }, controller.signal)) {
-        controller.abort()
+        activityCount++
+        // Wait for the recovered activity (second successful poll)
+        if (activityCount >= 2) controller.abort()
       }
 
-      assert.ok(statuses.includes(ConnectionStatus.Reconnecting))
-      // Should transition back to Connected after recovery
+      assert.ok(statuses.includes(ConnectionStatus.Reconnecting),
+        `Expected Reconnecting in: ${statuses}`)
       const reconnectIdx = statuses.indexOf(ConnectionStatus.Reconnecting)
       const connectedAfter = statuses.indexOf(ConnectionStatus.Connected, reconnectIdx)
       assert.ok(connectedAfter > reconnectIdx, 'Connected should follow Reconnecting')
     })
 
-    it('emits TokenExpired on 401', async () => {
+    it('emits TokenExpired on 401 and throws DirectLineHttpError', async () => {
       globalThis.fetch = mock.fn(async (url: string | URL | Request) => {
         const urlStr = typeof url === 'string' ? url : url instanceof URL ? url.href : url.url
         if (urlStr.includes('regionalchannelsettings')) {
@@ -522,6 +534,43 @@ describe('DirectLineClient', () => {
       const conversation = { conversationId: 'conv-1', token: 'tok-1', streamUrl: '' }
       const statuses: ConnectionStatus[] = []
 
+      try {
+        for await (const _ of client.listenPolling(conversation, {
+          interval: 50,
+          onStatusChange: (s) => statuses.push(s),
+        })) {
+          // Should not reach here
+        }
+        assert.fail('Should have thrown')
+      } catch (err) {
+        assert.ok(err instanceof DirectLineHttpError)
+        assert.equal(err.status, 401)
+      }
+
+      assert.ok(statuses.includes(ConnectionStatus.TokenExpired))
+    })
+
+    it('does NOT emit Reconnecting before initial Connected (state machine guard)', async () => {
+      // All polls fail — never reaches Connected state
+      let callCount = 0
+      globalThis.fetch = mock.fn(async (url: string | URL | Request) => {
+        const urlStr = typeof url === 'string' ? url : url instanceof URL ? url.href : url.url
+        if (urlStr.includes('regionalchannelsettings')) {
+          return new Response(JSON.stringify({ channelUrlsById: { directline: 'https://directline.botframework.com' } }), { status: 200 })
+        }
+        if (urlStr.includes('directline/token')) {
+          return new Response(JSON.stringify({ token: 'tok-1' }), { status: 200 })
+        }
+        callCount++
+        return new Response('Server Error', { status: 500, statusText: 'Internal Server Error' })
+      }) as any
+
+      const client = new DirectLineClient({ tokenEndpoint: TOKEN_ENDPOINT })
+      await client.getToken()
+
+      const conversation = { conversationId: 'conv-1', token: 'tok-1', streamUrl: '' }
+      const statuses: ConnectionStatus[] = []
+
       await assert.rejects(async () => {
         for await (const _ of client.listenPolling(conversation, {
           interval: 50,
@@ -529,9 +578,15 @@ describe('DirectLineClient', () => {
         })) {
           // Should not reach here
         }
-      }, /401/)
+      }, /Polling failed/)
 
-      assert.ok(statuses.includes(ConnectionStatus.TokenExpired))
+      // Should see Connecting → Disconnected, but NEVER Reconnecting
+      assert.ok(statuses.includes(ConnectionStatus.Connecting))
+      assert.ok(statuses.includes(ConnectionStatus.Disconnected))
+      assert.ok(!statuses.includes(ConnectionStatus.Reconnecting),
+        `Reconnecting should not appear before Connected. Got: ${statuses}`)
+      assert.ok(!statuses.includes(ConnectionStatus.Connected),
+        `Connected should not appear when all polls fail. Got: ${statuses}`)
     })
   })
 
