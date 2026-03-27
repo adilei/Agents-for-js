@@ -10,9 +10,11 @@ import {
   TokenResponse,
   DirectLineConversation,
   ActivitySet,
-  PollingOptions,
-  WebSocketOptions,
+  PollingListenerOptions,
+  WebSocketListenerOptions,
   ActivityInterceptor,
+  ConnectionStatus,
+  ConnectionStatusCallback,
 } from './types'
 
 const DEFAULT_DIRECTLINE_DOMAIN = 'https://directline.botframework.com/v3/directline'
@@ -22,7 +24,7 @@ const INITIAL_BACKOFF_MS = 1000
 /**
  * DirectLine v3 client for Copilot Studio agents.
  *
- * Handles token acquisition from the CPS token endpoint, regional domain
+ * Handles token acquisition from the MCS token endpoint, regional domain
  * discovery, conversation lifecycle, sending activities, and listening for
  * responses via both HTTP polling and WebSocket modes.
  *
@@ -39,8 +41,11 @@ const INITIAL_BACKOFF_MS = 1000
  *   console.log(activity.type, activity.text)
  * }
  *
- * // Or polling listener (fallback)
- * for await (const activity of client.listenPolling(conversation)) {
+ * // Or polling listener with status reporting and resume
+ * for await (const activity of client.listenPolling(conversation, {
+ *   watermark: savedWatermark,
+ *   onStatusChange: (status) => console.log('Status:', status),
+ * })) {
  *   console.log(activity.type, activity.text)
  * }
  * ```
@@ -83,12 +88,6 @@ export class DirectLineClient {
    * Derives the regional channel settings URL from the token endpoint and
    * fetches the regional DirectLine domain.
    *
-   * Token URL:    https://{env}.../powervirtualagents/botsbyschema/{bot}/directline/token?api-version={ver}
-   * Settings URL: https://{env}.../powervirtualagents/regionalchannelsettings?api-version={ver}
-   *
-   * Returns the full domain (e.g. "https://europe.directline.botframework.com/v3/directline")
-   * or falls back to the global default.
-   *
    * Only caches the domain when regional discovery succeeds. Transient failures
    * return the global default without caching, so the next call will retry.
    */
@@ -112,7 +111,6 @@ export class DirectLineClient {
       }
     }
 
-    // Return the default without caching so next call retries discovery
     return DEFAULT_DIRECTLINE_DOMAIN
   }
 
@@ -149,7 +147,6 @@ export class DirectLineClient {
       throw new Error('Start conversation response missing "conversationId"')
     }
 
-    // The response may include a refreshed token
     if (data.token) {
       this.token = data.token
     }
@@ -230,35 +227,49 @@ export class DirectLineClient {
    * Polling listener — yields new activities at a configurable interval.
    *
    * Tracks the watermark internally so each iteration only returns unseen
-   * activities. The generator runs until the caller breaks out of the loop
-   * or the AbortSignal fires.
+   * activities. Accepts an initial watermark via options for resuming after
+   * a disconnect.
    *
    * Transient errors (network, 5xx) are retried with exponential backoff
-   * up to {@link MAX_POLLING_RETRIES} times. Fatal errors (401) are rethrown
-   * immediately.
+   * up to {@link MAX_POLLING_RETRIES} times. Fatal errors (401) emit
+   * `TokenExpired` status and rethrow.
    *
    * @param conversation - The conversation to listen on.
-   * @param options - Polling interval and other options.
+   * @param options - Polling interval, resume watermark, status callback, interceptor.
    * @param signal - Optional AbortSignal to stop the listener.
-   * @param interceptor - Optional callback to inspect/filter each activity.
    */
   async * listenPolling (
     conversation: DirectLineConversation,
-    options?: PollingOptions,
+    options?: PollingListenerOptions,
     signal?: AbortSignal,
-    interceptor?: ActivityInterceptor,
   ): AsyncGenerator<Activity> {
     const interval = options?.interval ?? 1000
-    let watermark: string | undefined
+    const onStatus = options?.onStatusChange
+    const interceptor = options?.interceptor
+    let watermark: string | undefined = options?.watermark ?? conversation.watermark
+
+    onStatus?.(ConnectionStatus.Connecting)
+    let connected = false
     let consecutiveErrors = 0
 
     while (!signal?.aborted) {
       try {
         const result = await this.getActivities(conversation.conversationId, watermark)
+
+        if (!connected) {
+          connected = true
+          onStatus?.(ConnectionStatus.Connected)
+        } else if (consecutiveErrors > 0) {
+          // Recovered from transient errors
+          onStatus?.(ConnectionStatus.Connected)
+        }
+
         consecutiveErrors = 0
 
         if (result.watermark) {
           watermark = result.watermark
+          // Update the conversation object so the caller can read the latest watermark
+          conversation.watermark = watermark
         }
 
         for (const activity of result.activities) {
@@ -269,17 +280,19 @@ export class DirectLineClient {
           yield activity
         }
       } catch (err: any) {
-        // Fatal: 401 means token expired — caller must handle
         if (err?.message?.includes('401')) {
+          onStatus?.(ConnectionStatus.TokenExpired)
           throw err
         }
 
         consecutiveErrors++
+        onStatus?.(ConnectionStatus.Reconnecting)
+
         if (consecutiveErrors > MAX_POLLING_RETRIES) {
+          onStatus?.(ConnectionStatus.Disconnected)
           throw new Error(`Polling failed after ${MAX_POLLING_RETRIES} consecutive retries: ${err?.message}`)
         }
 
-        // Exponential backoff: 1s, 2s, 4s, 8s, 16s
         const backoff = INITIAL_BACKOFF_MS * Math.pow(2, consecutiveErrors - 1)
         await delay(backoff)
         continue
@@ -287,6 +300,8 @@ export class DirectLineClient {
 
       await delay(interval)
     }
+
+    onStatus?.(ConnectionStatus.Disconnected)
   }
 
   // ---------------------------------------------------------------------------
@@ -303,21 +318,23 @@ export class DirectLineClient {
    * start a new listener if needed.
    *
    * @param conversation - Must include a valid `streamUrl`.
-   * @param options - Connection timeout and other options.
+   * @param options - Connection timeout, status callback, interceptor.
    * @param signal - Optional AbortSignal to close the socket.
-   * @param interceptor - Optional callback to inspect/filter each activity.
    */
   async * listenWebSocket (
     conversation: DirectLineConversation,
-    options?: WebSocketOptions,
+    options?: WebSocketListenerOptions,
     signal?: AbortSignal,
-    interceptor?: ActivityInterceptor,
   ): AsyncGenerator<Activity> {
     if (!conversation.streamUrl) {
       throw new Error('No streamUrl available. Start a conversation first.')
     }
 
     const connectTimeout = options?.connectTimeout ?? 10_000
+    const onStatus = options?.onStatusChange
+    const interceptor = options?.interceptor
+
+    onStatus?.(ConnectionStatus.Connecting)
 
     const ws = new WebSocket(conversation.streamUrl)
     const messageQueue: Activity[] = []
@@ -328,6 +345,10 @@ export class DirectLineClient {
     ws.on('message', (data: WebSocket.Data) => {
       try {
         const parsed = JSON.parse(data.toString())
+        // Update watermark from WebSocket frames if present
+        if (parsed.watermark) {
+          conversation.watermark = parsed.watermark
+        }
         const activities: any[] = parsed.activities ?? []
         for (const raw of activities) {
           const activity = Activity.fromObject(raw)
@@ -337,7 +358,6 @@ export class DirectLineClient {
           }
           messageQueue.push(activity)
         }
-        // Wake up the consumer if it's waiting
         resolve?.()
       } catch {
         // Ignore unparseable frames
@@ -355,15 +375,12 @@ export class DirectLineClient {
       resolve?.()
     })
 
-    // Handle abort signal
     const onAbort = () => {
       ws.close()
     }
     signal?.addEventListener('abort', onAbort, { once: true })
 
-    // Wait for connection to open.
-    // Use ws.once for the error handler so it auto-removes after firing
-    // and doesn't duplicate the top-level 'error' handler.
+    // Wait for connection to open
     await new Promise<void>((res, rej) => {
       const timeout = setTimeout(() => {
         ws.close()
@@ -375,30 +392,23 @@ export class DirectLineClient {
         res()
       })
 
-      // This handler fires only if the connection fails before opening.
-      // After the promise settles, the top-level 'error' handler takes over.
       ws.once('error', (err) => {
         clearTimeout(timeout)
         rej(err)
       })
     })
 
+    onStatus?.(ConnectionStatus.Connected)
+
     try {
       while (!closed && !signal?.aborted) {
-        // Drain the queue
         while (messageQueue.length > 0) {
           yield messageQueue.shift()!
         }
 
         if (closed || signal?.aborted) break
-
-        // Check if messages arrived while we were yielding (race fix:
-        // messages can arrive while the generator consumer is suspended
-        // mid-drain, when resolve is undefined). If so, drain again
-        // instead of sleeping.
         if (messageQueue.length > 0) continue
 
-        // Wait for the next message or close
         await new Promise<void>((res) => {
           resolve = res
         })
@@ -408,7 +418,6 @@ export class DirectLineClient {
         }
       }
 
-      // Drain any remaining messages
       while (messageQueue.length > 0) {
         yield messageQueue.shift()!
       }
@@ -417,6 +426,7 @@ export class DirectLineClient {
       if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
         ws.close()
       }
+      onStatus?.(ConnectionStatus.Disconnected)
     }
   }
 }
@@ -425,9 +435,6 @@ export class DirectLineClient {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/**
- * Derives the regional channel settings URL from a CPS token endpoint.
- */
 function getRegionalChannelSettingsUrl (tokenEndpoint: string): string | null {
   const pvaIndex = tokenEndpoint.indexOf('/powervirtualagents')
   if (pvaIndex === -1) return null
